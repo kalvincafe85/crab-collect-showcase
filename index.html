@@ -58,6 +58,17 @@ h1, h2, h3, h4, p, ul { margin: 0; }
 .stage.dragging { cursor: grabbing; }
 .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .stage .status { position: absolute; left: 14px; bottom: 12px; font-family: var(--font-mono); font-size: 14px; color: var(--muted); background: rgba(0,0,0,0.5); padding: 3px 10px; border-radius: 6px; }
+/* 載入畫面（2026-11-05 使用者）：預覽區中央轉圈 + 進度條；後面頁面在背景依序載入 */
+.stage .loader { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; pointer-events: none; }
+.stage .loader[hidden] { display: none; }
+.loader .spin { width: 54px; height: 54px; border-radius: 50%; border: 4px solid rgba(255,255,255,0.12); border-top-color: #e8c46a; animation: scspin 0.9s linear infinite; }
+@keyframes scspin { to { transform: rotate(360deg); } }
+.loader .ltxt { font-size: 17px; color: var(--ink, #eee); letter-spacing: 0.04em; }
+.loader .lsub { font-family: var(--font-mono); font-size: 13px; color: var(--muted); min-height: 1em; }
+.loader .lbar { width: min(340px, 60%); height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); overflow: hidden; }
+.loader .lbar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #3fb7a8, #e8c46a); transition: width 0.25s; }
+.loader.indet .lbar i { width: 35% !important; animation: scindet 1.2s ease-in-out infinite; }
+@keyframes scindet { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
 .controls { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px 16px; border-top: 1px solid var(--line); }
 .ctl1 { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 10px; }
 .ctl2 { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; }
@@ -11012,7 +11023,8 @@ function spineSlide(s) {
   return { id: s.id, title: s.cat + "｜" + s.name, spine: s, html:
     '<div class="shead"><div><p class="eyebrow">' + esc(s.zh) + '｜' + esc(s.cat) + '</p><h2>' + esc(s.name) + '</h2></div>'
     + '<div class="right"><span class="meta anims-meta">&nbsp;</span></div></div>'
-    + '<div class="sbody"><div class="player"><div class="stage"><span class="status">載入中…</span></div>'
+    + '<div class="sbody"><div class="player"><div class="stage"><span class="status" hidden></span>'
+    + '<div class="loader indet"><div class="spin"></div><div class="ltxt">載入中…</div><div class="lbar"><i></i></div><div class="lsub"></div></div></div>'
     + '<div class="controls"><div class="ctl1"><div class="animbar" role="group" aria-label="動畫"></div>'
     + '<div class="speed" role="group" aria-label="播放速度"><button class="btn" type="button" data-speed="1" aria-pressed="true">1×</button><button class="btn" type="button" data-speed="0.5" aria-pressed="false">0.5×</button><button class="btn" type="button" data-speed="0.25" aria-pressed="false">0.25×</button></div>'
     + '</div>'
@@ -11061,10 +11073,36 @@ let renderer = null;
 if (gl) { gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true); renderer = new spine.webgl.SceneRenderer(canvas, gl); }
 const atlasCache = {}, dataCache = {};
 /* 類別資料（base64 骨架 / 圖集 / 貼圖）放在 showcase_data/<類別>.js，切到那個類別才載入 */
+/* 載入進度：http(s) 用 fetch 串流算已下載的量（file:// 不能 fetch → 退回 <script>，只顯示轉圈） */
+const loadProg = {};   // cat -> { got, total, phase: "net" | "decode" | "done" }
+const progListeners = new Set();
+const setProg = (cat, o) => { loadProg[cat] = Object.assign(loadProg[cat] || {}, o); progListeners.forEach((f) => f(cat)); };
+const SC_URL = (cat) => "showcase_data/" + encodeURIComponent(cat) + ".js";
 function loadData(cat) {
   if (dataCache[cat]) return dataCache[cat];
+  const total = catOf[cat].mb * 1e6;
+  setProg(cat, { got: 0, total, phase: "net" });
+  if (/^https?:$/.test(location.protocol) && window.fetch && window.ReadableStream) {
+    return dataCache[cat] = (async () => {
+      const r = await fetch(SC_URL(cat));
+      if (!r.ok) throw new Error("讀不到 showcase_data/" + cat + ".js（HTTP " + r.status + "）");
+      const rd = r.body.getReader(), parts = []; let got = 0, lastT = 0;
+      for (;;) {
+        const { done, value } = await rd.read(); if (done) break;
+        parts.push(value); got += value.length;
+        const t = performance.now(); if (t - lastT > 100) { lastT = t; setProg(cat, { got }); }
+      }
+      setProg(cat, { got: total, phase: "decode" });
+      const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+      const sc = document.createElement("script"); sc.textContent = new TextDecoder().decode(buf);
+      document.head.appendChild(sc); sc.remove();   // 內嵌 script 會同步執行
+      if (!(window.__SC_DATA && window.__SC_DATA[cat])) throw new Error("資料檔內容不對：" + cat);
+      return window.__SC_DATA[cat];
+    })().catch((e) => { delete dataCache[cat]; setProg(cat, { phase: "error", err: e.message }); throw e; });
+  }
+  setProg(cat, { indet: true });
   return dataCache[cat] = new Promise((res, rej) => {
-    const sc = document.createElement("script"); sc.src = "showcase_data/" + encodeURIComponent(cat) + ".js";
+    const sc = document.createElement("script"); sc.src = SC_URL(cat);
     sc.onload = () => (window.__SC_DATA && window.__SC_DATA[cat]) ? res(window.__SC_DATA[cat]) : rej(new Error("資料檔內容不對：" + cat));
     sc.onerror = () => rej(new Error("讀不到 showcase_data/" + cat + ".js（HTML 要和 showcase_data 資料夾放在一起）"));
     document.head.appendChild(sc);
@@ -11080,8 +11118,9 @@ function loadAtlas(cat) {
     })));
     const atlas = new spine.TextureAtlas(c.atlas, (p) => tex[p] || tex[Object.keys(tex)[0]]);
     const pageIdx = new Map(); atlas.pages.forEach((p, i) => pageIdx.set(p, i));
+    setProg(cat, { phase: "done" });
     return { atlas, pageIdx };
-  })();
+  })().catch((e) => { delete atlasCache[cat]; throw e; });
 }
 const b64bytes = (s) => { const bin = atob(s), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
 
@@ -11138,7 +11177,8 @@ const poseAt = (it, t) => {
 
 class Player {
   constructor(el, def) {
-    this.el = el; this.def = def; this.status = el.querySelector(".status");
+    this.el = el; this.def = def; this.status = el.querySelector(".status"); this.loader = el.querySelector(".loader");
+    progListeners.add((cat) => { if (cat === def.cat && !this.ready) this.showProg(); });
     this.range = el.querySelector("input[type=range]"); this.tc = el.querySelector(".now");
     this.speed = 1; this.paused = false; this.active = false; this.ready = false; this.started = false;
     this.cur = null; this.t = 0; this.dbg = { bones: false, mesh: false, verts: false }; this.items = [];
@@ -11180,9 +11220,21 @@ class Player {
   }
   setPaused(p) { this.paused = p; const b = this.q("button.pp"); b.classList.toggle("paused", p); b.setAttribute("aria-label", p ? "播放" : "暫停"); }
   dur() { return this.items.reduce((m, it) => Math.max(m, it.anim ? it.anim.duration : 0), 0); }
+  showProg(msg) {
+    const L = this.loader, pg = loadProg[this.def.cat] || {}, total = catOf[this.def.cat].mb;
+    const txt = L.querySelector(".ltxt"), sub = L.querySelector(".lsub"), bar = L.querySelector(".lbar i");
+    L.hidden = false;
+    if (msg) { L.classList.remove("indet"); L.querySelector(".spin").hidden = true; txt.textContent = msg; sub.textContent = ""; return; }
+    const net = pg.phase === "net" && !pg.indet && pg.total;
+    L.classList.toggle("indet", !net);
+    const pct = net ? Math.min(99, Math.floor(pg.got / pg.total * 100)) : 0;
+    bar.style.width = pct + "%";
+    txt.textContent = !pg.phase ? "等待載入…（前面頁面載入中）" : pg.phase === "net" ? "載入中 " + (net ? pct + "%" : "…") : "準備動畫中…";
+    sub.textContent = this.def.cat + " 資料 " + (net ? (pg.got / 1e6).toFixed(1) + " / " : "") + total + " MB";
+  }
   async start() {
     if (this.started) return this.starting; this.started = true;
-    this.status.textContent = "載入 " + this.def.cat + " 資料（" + catOf[this.def.cat].mb + " MB）…";
+    this.showProg();
     return this.starting = this._start();
   }
   async _start() {
@@ -11201,9 +11253,9 @@ class Player {
       });
       this.layout();
       this.buildUi(); this.countRig();
-      this.ready = true; this.status.hidden = true;
+      this.ready = true; this.status.hidden = true; this.loader.hidden = true;
       if (this.active) this.autoplay();
-    } catch (e) { this.status.textContent = "無法即時播放：" + e.message; this.started = false; }
+    } catch (e) { this.showProg("無法即時播放：" + e.message); this.started = false; }
   }
   /* 多個骨架：用各自第一支動畫的可見範圍算寬度，等寬格子橫排置中 */
   layout() {
@@ -11477,8 +11529,6 @@ function go(i) {
   cur = i;
   const p = players[now.id];
   if (p) { p.active = true; p.start().then(() => p.autoplay()); }
-  const nb = slides[i + 1] && players[slides[i + 1].id];
-  if (nb) setTimeout(() => nb.start(), 300);
   document.getElementById("pageno").textContent = (i + 1) + " / " + slides.length;
   document.getElementById("navtitle").textContent = now.id === "cover" ? "" : now.title;
   document.getElementById("navinfo").style.visibility = now.id === "cover" ? "hidden" : "";   // 封面只留兩行標題
@@ -11498,6 +11548,16 @@ document.addEventListener("keydown", (e) => {
 deck.addEventListener("click", (e) => { const b = e.target.closest("[data-go]"); if (b) go(slides.findIndex((s) => s.id === b.dataset.go)); });
 const hashIdx = () => { let h = location.hash; try { h = decodeURIComponent(h); } catch (e) { /* 留原樣 */ } return slides.findIndex((s) => "#" + s.id === h); };
 const startAt = hashIdx(); go(startAt > 0 ? startAt : 0);
+/* 背景依序預載（2026-11-05 使用者）：從第一頁開始一頁一頁載，看前面的同時後面在載；
+   正在看的頁面還沒載到時，go() 會直接先載它（插隊），預載迴圈之後遇到已載好的就跳過 */
+(async () => {
+  for (const s of slides) {
+    const p = players[s.id]; if (!p) continue;
+    const cp = players[slides[cur].id];
+    if (cp && !cp.ready && cp.starting) { try { await cp.starting; } catch (e) { /* 錯誤顯示在該頁 */ } }
+    try { await p.start(); } catch (e) { /* 錯誤顯示在該頁 */ }
+  }
+})();
 window.addEventListener("hashchange", () => { const i = hashIdx(); if (i >= 0 && i !== cur) go(i); });
 
 let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsT = 0;
